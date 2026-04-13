@@ -42,6 +42,29 @@ def get_device():
     return "cpu", torch.float32
 
 
+def transformer_hidden_size(transformer) -> int:
+    """
+    Hidden width of a diffusers ``Transformer2DModel`` (e.g. PixArt DiT).
+
+    Newer diffusers configs expose ``num_attention_heads`` and
+    ``attention_head_dim`` only; legacy code used ``hidden_size``.
+    """
+    cfg = transformer.config
+    legacy = getattr(cfg, "hidden_size", None)
+    if legacy is not None:
+        return int(legacy)
+    return int(cfg.num_attention_heads) * int(cfg.attention_head_dim)
+
+
+def transformer_head_dim(transformer) -> int:
+    """Per-head dimension (``attention_head_dim`` or ``hidden_size // n_heads``)."""
+    cfg = transformer.config
+    adim = getattr(cfg, "attention_head_dim", None)
+    if adim is not None:
+        return int(adim)
+    return transformer_hidden_size(transformer) // int(cfg.num_attention_heads)
+
+
 # ---------------------------------------------------------------------------
 #  Model / pipeline loading
 # ---------------------------------------------------------------------------
@@ -213,11 +236,13 @@ def extract_projected_word_vectors(
                     break
 
         if emb_data is not None:
-            caption_emb = emb_data["caption_embeds"]        # (seq_len, 4096)
+            caption_emb = emb_data["caption_embeds"]        # (1, seq_len, 4096) or (seq_len, 4096)
+            if caption_emb.ndim == 3:
+                caption_emb = caption_emb[0]                # → (seq_len, 4096)
             if idx < caption_emb.shape[0]:
                 raw_vecs.append(caption_emb[idx].float())
             else:
-                raw_vecs.append(caption_emb[-2].float())
+                raw_vecs.append(caption_emb[-1].float())    # fallback: last real token
         else:
             raw_vecs.append(torch.zeros(4096))
 
@@ -265,7 +290,7 @@ def compute_head_alignment(
             n_perm=n_perm, verbose=verbose,
         )
 
-    hidden_size = transformer.config.hidden_size
+    hidden_size = transformer_hidden_size(transformer)
     pos_embed_2d = torch.tensor(
         get_2d_sincos_pos_embed(hidden_size, base_size),
         dtype=torch.float32,
@@ -290,7 +315,7 @@ def compute_head_alignment(
 
     n_layers = len(transformer.transformer_blocks)
     n_heads = transformer.config.num_attention_heads
-    head_dim = hidden_size // n_heads
+    head_dim = transformer_head_dim(transformer)
 
     rows = []
     for li in range(n_layers):
@@ -357,7 +382,7 @@ def get_head_weights(transformer, layer_idx: int, head_idx: int):
     W_o_h : (hidden_size, head_dim)
     """
     blk = transformer.transformer_blocks[layer_idx]
-    hd = transformer.config.hidden_size // transformer.config.num_attention_heads
+    hd = transformer_head_dim(transformer)
     s = slice(head_idx * hd, (head_idx + 1) * hd)
     return (
         blk.attn2.to_q.weight[s, :].detach().float().cpu(),
@@ -504,6 +529,10 @@ def _forward_attn_capture(attn, hidden_states, encoder_hidden_states,
     storage["attn_weights"] = probs.detach().cpu()
 
     hidden_states = torch.matmul(probs, value)
+
+    # Store per-head output before reshape (for activation patching)
+    # Shape: (batch, n_heads, n_patches, head_dim)
+    storage["head_out"] = hidden_states.detach().cpu()
     hidden_states = hidden_states.transpose(1, 2).reshape(bs, -1, inner_dim)
     hidden_states = attn.to_out[0](hidden_states)
     hidden_states = attn.to_out[1](hidden_states)
