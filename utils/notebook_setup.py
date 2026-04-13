@@ -529,6 +529,10 @@ def _forward_attn_capture(attn, hidden_states, encoder_hidden_states,
     storage["attn_weights"] = probs.detach().cpu()
 
     hidden_states = torch.matmul(probs, value)
+
+    # Store per-head output before reshape (for activation patching)
+    # Shape: (batch, n_heads, n_patches, head_dim)
+    storage["head_out"] = hidden_states.detach().cpu()
     hidden_states = hidden_states.transpose(1, 2).reshape(bs, -1, inner_dim)
     hidden_states = attn.to_out[0](hidden_states)
     hidden_states = attn.to_out[1](hidden_states)
