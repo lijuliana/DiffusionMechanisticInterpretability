@@ -10,7 +10,7 @@ from __future__ import annotations
 import gc
 from dataclasses import dataclass
 from os.path import basename, join
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,7 @@ import torch
 from tqdm.auto import tqdm
 
 from utils.eval_cached_embeddings import evaluate_pipeline_on_prompts_with_cached_embeddings
+from utils.pixart_utils import load_pixart_ema_into_transformer
 from utils.zero_head_ablation_utils import apply_zero_head_ablation_multi, restore_processors
 
 
@@ -101,8 +102,26 @@ def _head_weight_views(cross_attn_module, head_idx: int) -> tuple[torch.Tensor, 
 
 
 def _top_singular_triplet(matrix: torch.Tensor) -> tuple[float, torch.Tensor, torch.Tensor]:
-    u, s, vh = torch.linalg.svd(matrix.float(), full_matrices=False)
-    return float(s[0].item()), u[:, 0], vh[0, :]
+    # MPS lacks linalg.svd; keep matmul operands on the original device.
+    dev = matrix.device
+    u, s, vh = torch.linalg.svd(matrix.float().cpu(), full_matrices=False)
+    return float(s[0].item()), u[:, 0].to(dev, dtype=torch.float32), vh[0, :].to(dev, dtype=torch.float32)
+
+
+def _top_singular_subspace(matrix: torch.Tensor, max_rank: int = 4) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dev = matrix.device
+    u, s, vh = torch.linalg.svd(matrix.float().cpu(), full_matrices=False)
+    rank = max(1, min(int(max_rank), int(s.numel())))
+    return (
+        u[:, :rank].to(dev, dtype=torch.float32),
+        s[:rank].to(dev, dtype=torch.float32),
+        vh[:rank, :].to(dev, dtype=torch.float32),
+    )
+
+
+def _spectral_norm_cpu(matrix: torch.Tensor) -> float:
+    """Operator-2 norm via CPU SVD (works when ``matrix`` is on MPS)."""
+    return float(torch.linalg.matrix_norm(matrix.float().cpu(), ord=2).item())
 
 
 def _safe_corr(a: pd.Series, b: pd.Series) -> float:
@@ -127,6 +146,357 @@ def _rank_turn_on(series: pd.Series) -> float:
     if len(idx) == 0:
         return np.nan
     return float(idx[0])
+
+
+def _to_float_tensor(feature_matrix: torch.Tensor | np.ndarray | Sequence[Sequence[float]]) -> torch.Tensor:
+    if isinstance(feature_matrix, torch.Tensor):
+        tensor = feature_matrix.detach().float().cpu()
+    else:
+        tensor = torch.as_tensor(np.asarray(feature_matrix), dtype=torch.float32)
+    if tensor.ndim != 2:
+        raise ValueError(f"Expected a rank-2 feature matrix, got shape {tuple(tensor.shape)}")
+    return tensor
+
+
+def _row_normalize(matrix: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    if matrix.ndim != 2:
+        raise ValueError(f"Expected a rank-2 matrix to normalize, got shape {tuple(matrix.shape)}")
+    norms = torch.linalg.vector_norm(matrix, dim=1, keepdim=True).clamp_min(eps)
+    return matrix / norms
+
+
+def build_grouped_feature_bank(
+    feature_matrix: torch.Tensor | np.ndarray | Sequence[Sequence[float]],
+    labels: Sequence[Any],
+    *,
+    prefix: str,
+    max_rank: int = 4,
+    center: bool = True,
+) -> dict[str, Any]:
+    """
+    Build reusable prototype and subspace summaries from token-level feature vectors.
+
+    Parameters
+    ----------
+    feature_matrix:
+        Rank-2 tensor/array with shape [n_samples, feature_dim].
+    labels:
+        Group labels (e.g. ``square``, ``circle``) for each row of ``feature_matrix``.
+    prefix:
+        Namespace for downstream dataframe columns.
+    max_rank:
+        Maximum number of singular directions to retain for the feature bank subspace.
+    center:
+        If true, center the full feature matrix before extracting the shared subspace.
+    """
+    features = _to_float_tensor(feature_matrix)
+    if len(labels) != int(features.shape[0]):
+        raise ValueError(f"labels length {len(labels)} does not match feature rows {int(features.shape[0])}")
+    label_names = [str(label) for label in pd.unique(pd.Series(labels))]
+    if len(label_names) == 0:
+        raise ValueError("Feature bank requires at least one label.")
+
+    prototypes: list[torch.Tensor] = []
+    counts: list[int] = []
+    label_series = pd.Series(labels).astype(str)
+    for label_name in label_names:
+        idx = torch.as_tensor(np.where(label_series.values == label_name)[0], dtype=torch.long)
+        group_feats = features.index_select(0, idx)
+        prototypes.append(group_feats.mean(dim=0))
+        counts.append(int(group_feats.shape[0]))
+
+    prototype_matrix = torch.stack(prototypes, dim=0)
+    prototype_unit = _row_normalize(prototype_matrix)
+
+    subspace_source = features.clone()
+    if center and subspace_source.shape[0] > 1:
+        subspace_source = subspace_source - subspace_source.mean(dim=0, keepdim=True)
+    if subspace_source.shape[0] == 1:
+        basis = _row_normalize(subspace_source)
+        singular_values = torch.ones(1, dtype=torch.float32)
+    else:
+        _, singular_values, vh = torch.linalg.svd(subspace_source, full_matrices=False)
+        rank = max(1, min(int(max_rank), int(vh.shape[0])))
+        basis = vh[:rank, :]
+        singular_values = singular_values[:rank]
+
+    return {
+        "prefix": str(prefix),
+        "feature_dim": int(features.shape[1]),
+        "label_names": label_names,
+        "counts": counts,
+        "prototype_matrix": prototype_matrix,
+        "prototype_unit": prototype_unit,
+        "basis": basis,
+        "singular_values": singular_values,
+    }
+
+
+def _score_ov_write_to_feature_bank(
+    ov_matrix: torch.Tensor,
+    feature_bank: Mapping[str, Any],
+    *,
+    eps: float = 1e-8,
+) -> dict[str, Any]:
+    prefix = str(feature_bank["prefix"])
+    dev = ov_matrix.device
+    prototypes = feature_bank["prototype_unit"].float().to(device=dev, dtype=torch.float32)
+    basis = feature_bank["basis"].float().to(device=dev, dtype=torch.float32)
+    ov_matrix = ov_matrix.float()
+    ov_fro = float(torch.linalg.matrix_norm(ov_matrix, ord="fro").item())
+
+    write_outputs = (ov_matrix @ prototypes.T).T
+    output_norms = torch.linalg.vector_norm(write_outputs, dim=1)
+    norm_mean = float(output_norms.mean().item()) if output_norms.numel() > 0 else np.nan
+    norm_max = float(output_norms.max().item()) if output_norms.numel() > 0 else np.nan
+    best_idx = int(torch.argmax(output_norms).item()) if output_norms.numel() > 0 else -1
+    prototype_score = norm_mean / max(ov_fro, eps) if np.isfinite(norm_mean) else np.nan
+
+    basis_outputs = ov_matrix @ basis.T
+    subspace_rank = int(basis.shape[0])
+    subspace_energy = float(torch.linalg.matrix_norm(basis_outputs, ord="fro").item())
+    subspace_score = subspace_energy / max(ov_fro * max(subspace_rank, 1) ** 0.5, eps)
+
+    distinctiveness = np.nan
+    if int(write_outputs.shape[0]) >= 2:
+        write_unit = _row_normalize(write_outputs)
+        cosine_mat = write_unit @ write_unit.T
+        triu_idx = torch.triu_indices(cosine_mat.shape[0], cosine_mat.shape[1], offset=1)
+        if triu_idx.numel() > 0:
+            pairwise_cos = cosine_mat[triu_idx[0], triu_idx[1]]
+            distinctiveness = float((1.0 - pairwise_cos.mean()).item())
+
+    score_terms = [prototype_score, subspace_score]
+    if np.isfinite(distinctiveness):
+        score_terms.append(distinctiveness)
+    write_score = float(np.mean(score_terms)) if score_terms else np.nan
+
+    row: dict[str, Any] = {
+        f"{prefix}_write_norm_mean": norm_mean,
+        f"{prefix}_write_norm_max": norm_max,
+        f"{prefix}_prototype_score": prototype_score,
+        f"{prefix}_subspace_score": subspace_score,
+        f"{prefix}_distinctiveness": distinctiveness,
+        f"{prefix}_write_score": write_score,
+        f"{prefix}_best_label": feature_bank["label_names"][best_idx] if best_idx >= 0 else None,
+    }
+    for label_name, label_norm in zip(feature_bank["label_names"], output_norms.tolist()):
+        safe_label = str(label_name).replace(" ", "_")
+        row[f"{prefix}_write_norm__{safe_label}"] = float(label_norm)
+    return row
+
+
+def _score_structural_chain_to_feature_bank(
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    ov_matrix: torch.Tensor,
+    source_write_vec: torch.Tensor,
+    feature_bank: Mapping[str, Any],
+    *,
+    eps: float = 1e-8,
+) -> dict[str, Any]:
+    """
+    Measure an end-to-end OV-QK-OV chain for a specific text feature bank.
+
+    For each bank prototype, this scores:
+    - whether the candidate's query can read the source head's write vector
+    - whether the candidate's key matches that text prototype
+    - whether the candidate's OV map writes strong features for that prototype
+    """
+    prefix = str(feature_bank["prefix"])
+    dev = ov_matrix.device
+    prototypes = feature_bank["prototype_unit"].float().to(device=dev, dtype=torch.float32)
+
+    q_source = q_w.float() @ source_write_vec.float()
+    q_source_norm = float(torch.linalg.vector_norm(q_source).item())
+
+    key_outputs = (k_w.float() @ prototypes.T).T
+    key_norms = torch.linalg.vector_norm(key_outputs, dim=1)
+    qk_logits = key_outputs @ q_source
+    qk_cosines = qk_logits / key_norms.clamp_min(eps) / max(q_source_norm, eps)
+
+    write_outputs = (ov_matrix.float() @ prototypes.T).T
+    write_norms = torch.linalg.vector_norm(write_outputs, dim=1)
+    ov_fro = float(torch.linalg.matrix_norm(ov_matrix.float(), ord="fro").item())
+    write_norms_norm = write_norms / max(ov_fro, eps)
+
+    chain_scores = torch.clamp(qk_cosines, min=0.0) * write_norms_norm
+
+    qk_best_idx = int(torch.argmax(qk_cosines).item()) if qk_cosines.numel() > 0 else -1
+    chain_best_idx = int(torch.argmax(chain_scores).item()) if chain_scores.numel() > 0 else -1
+    qk_sorted = torch.sort(qk_cosines, descending=True).values
+    chain_sorted = torch.sort(chain_scores, descending=True).values
+
+    row: dict[str, Any] = {
+        f"{prefix}_qk_logit_mean": float(qk_logits.mean().item()) if qk_logits.numel() > 0 else np.nan,
+        f"{prefix}_qk_logit_max": float(qk_logits.max().item()) if qk_logits.numel() > 0 else np.nan,
+        f"{prefix}_qk_cosine_mean": float(qk_cosines.mean().item()) if qk_cosines.numel() > 0 else np.nan,
+        f"{prefix}_qk_cosine_max": float(qk_cosines.max().item()) if qk_cosines.numel() > 0 else np.nan,
+        f"{prefix}_qk_best_label": feature_bank["label_names"][qk_best_idx] if qk_best_idx >= 0 else None,
+        f"{prefix}_qk_margin": float((qk_sorted[0] - qk_sorted[1]).item()) if qk_sorted.numel() >= 2 else np.nan,
+        f"{prefix}_chain_score_mean": float(chain_scores.mean().item()) if chain_scores.numel() > 0 else np.nan,
+        f"{prefix}_chain_score_max": float(chain_scores.max().item()) if chain_scores.numel() > 0 else np.nan,
+        f"{prefix}_chain_score_sum": float(chain_scores.sum().item()) if chain_scores.numel() > 0 else np.nan,
+        f"{prefix}_chain_best_label": feature_bank["label_names"][chain_best_idx] if chain_best_idx >= 0 else None,
+        f"{prefix}_chain_margin": float((chain_sorted[0] - chain_sorted[1]).item()) if chain_sorted.numel() >= 2 else np.nan,
+    }
+    for label_name, qk_cos, chain_score in zip(
+        feature_bank["label_names"],
+        qk_cosines.tolist(),
+        chain_scores.tolist(),
+    ):
+        safe_label = str(label_name).replace(" ", "_")
+        row[f"{prefix}_qk_cosine__{safe_label}"] = float(qk_cos)
+        row[f"{prefix}_chain_score__{safe_label}"] = float(chain_score)
+    return row
+
+
+def rank_candidate_heads_by_feature_probes(
+    transformer,
+    source_head: tuple[int, int],
+    probe_vectors: Mapping[str, torch.Tensor | np.ndarray | Sequence[float]],
+    *,
+    probe_groups: Mapping[str, Sequence[str]] | None = None,
+    candidate_layers: str = "later_only",
+    candidate_head_pairs: Iterable[tuple[int, int]] | None = None,
+    source_rank: int = 4,
+    show_progress: bool = False,
+    progress_desc: str = "Feature probe scoring",
+    eps: float = 1e-8,
+) -> pd.DataFrame:
+    """
+    Score later heads against arbitrary object/text feature probes.
+
+    Each probe is a single feature vector (for example ``square``, ``red_square``,
+    or a variance-partition effect vector). For each candidate head we measure:
+    - direct OV write strength for that probe
+    - cosine overlap between the OV output and the source-head write direction
+    - QK compatibility between the source write direction and that probe
+    - an end-to-end chain score combining QK compatibility and OV write strength
+    """
+    transformer = _resolve_cross_attn_transformer(transformer)
+    if len(transformer.transformer_blocks) == 0:
+        raise AttributeError("Expected transformer.transformer_blocks for feature probe scoring.")
+    if not probe_vectors:
+        raise ValueError("probe_vectors must contain at least one probe.")
+
+    probe_groups = {str(k): [str(name) for name in v] for k, v in (probe_groups or {}).items()}
+    prepared_probes: dict[str, torch.Tensor] = {}
+    for probe_name, probe_vec in probe_vectors.items():
+        tensor = torch.as_tensor(np.asarray(probe_vec), dtype=torch.float32).reshape(-1)
+        norm = float(torch.linalg.vector_norm(tensor).item())
+        if not np.isfinite(norm) or norm <= eps:
+            continue
+        prepared_probes[str(probe_name)] = tensor / norm
+    if not prepared_probes:
+        raise ValueError("All probe vectors were zero-norm or invalid.")
+
+    source_layer, source_head_idx = map(int, source_head)
+    source_attn = transformer.transformer_blocks[source_layer].attn2
+    _, _, source_v_w, source_o_w = _head_weight_views(source_attn, source_head_idx)
+    source_ov = source_o_w.float() @ source_v_w.float()
+    source_u, source_s, source_vh = _top_singular_subspace(source_ov, max_rank=source_rank)
+    source_write_vec = source_u[:, 0]
+    source_cond_vec = source_vh[0, :]
+    source_write_norm = float(torch.linalg.vector_norm(source_write_vec).item())
+
+    candidate_pairs = _iter_candidate_heads(
+        n_layers=len(transformer.transformer_blocks),
+        n_heads=int(source_attn.heads),
+        source_head=source_head,
+        candidate_layers=candidate_layers,
+        candidate_head_pairs=candidate_head_pairs,
+    )
+    iterator = tqdm(candidate_pairs, desc=progress_desc, unit="head", mininterval=1) if show_progress else candidate_pairs
+
+    rows: list[dict[str, Any]] = []
+    for layer_idx, head_idx in iterator:
+        cross_attn = transformer.transformer_blocks[int(layer_idx)].attn2
+        q_w, k_w, cand_v_w, cand_o_w = _head_weight_views(cross_attn, int(head_idx))
+        q_w = q_w.float()
+        k_w = k_w.float()
+        cand_v_w = cand_v_w.float()
+        cand_o_w = cand_o_w.float()
+        cand_ov = cand_o_w @ cand_v_w
+
+        cand_ov_fro = float(torch.linalg.matrix_norm(cand_ov, ord="fro").item())
+        q_source = q_w @ source_write_vec
+        q_source_norm = float(torch.linalg.vector_norm(q_source).item())
+
+        row: dict[str, Any] = {
+            "layer_idx": int(layer_idx),
+            "head_idx": int(head_idx),
+            "head_label": f"L{int(layer_idx)}H{int(head_idx)}",
+            "source_head": f"L{source_layer}H{source_head_idx}",
+            "candidate_ov_frob_norm": cand_ov_fro,
+            "source_write_probe_norm": source_write_norm,
+            "source_cond_probe_norm": float(torch.linalg.vector_norm(source_cond_vec).item()),
+        }
+
+        for probe_name, probe_vec_cpu in prepared_probes.items():
+            probe = probe_vec_cpu.to(device=cand_ov.device, dtype=torch.float32)
+            k_probe = k_w @ probe
+            vo_probe = cand_ov @ probe
+
+            k_probe_norm = float(torch.linalg.vector_norm(k_probe).item())
+            vo_probe_norm = float(torch.linalg.vector_norm(vo_probe).item())
+            qk_logit = float(torch.dot(k_probe, q_source).item())
+            qk_cosine = qk_logit / max(k_probe_norm * q_source_norm, eps)
+            vo_source_cosine = float(torch.dot(vo_probe, source_write_vec).item()) / max(vo_probe_norm * source_write_norm, eps)
+            chain_score = max(qk_cosine, 0.0) * (vo_probe_norm / max(cand_ov_fro, eps))
+
+            safe_name = str(probe_name).replace(" ", "_")
+            row[f"{safe_name}_k_probe_norm"] = k_probe_norm
+            row[f"{safe_name}_vo_probe_norm"] = vo_probe_norm
+            row[f"{safe_name}_vo_probe_norm_norm"] = vo_probe_norm / max(cand_ov_fro, eps)
+            row[f"{safe_name}_vo_source_cosine"] = vo_source_cosine
+            row[f"{safe_name}_qk_logit"] = qk_logit
+            row[f"{safe_name}_qk_cosine"] = qk_cosine
+            row[f"{safe_name}_chain_score"] = chain_score
+
+        for group_name, member_names in probe_groups.items():
+            safe_group = str(group_name).replace(" ", "_")
+            member_safe_names = [str(name).replace(" ", "_") for name in member_names if str(name) in prepared_probes]
+            if not member_safe_names:
+                continue
+
+            chain_vals = np.asarray([row.get(f"{name}_chain_score", np.nan) for name in member_safe_names], dtype=float)
+            vo_vals = np.asarray([row.get(f"{name}_vo_probe_norm_norm", np.nan) for name in member_safe_names], dtype=float)
+            qk_vals = np.asarray([row.get(f"{name}_qk_cosine", np.nan) for name in member_safe_names], dtype=float)
+            overlap_vals = np.asarray([row.get(f"{name}_vo_source_cosine", np.nan) for name in member_safe_names], dtype=float)
+
+            if np.isfinite(chain_vals).any():
+                best_idx = int(np.nanargmax(chain_vals))
+                row[f"{safe_group}_chain_score_max"] = float(np.nanmax(chain_vals))
+                row[f"{safe_group}_chain_score_mean"] = float(np.nanmean(chain_vals))
+                row[f"{safe_group}_best_probe_by_chain"] = member_names[best_idx]
+            else:
+                row[f"{safe_group}_chain_score_max"] = np.nan
+                row[f"{safe_group}_chain_score_mean"] = np.nan
+                row[f"{safe_group}_best_probe_by_chain"] = None
+
+            if np.isfinite(vo_vals).any():
+                best_idx = int(np.nanargmax(vo_vals))
+                row[f"{safe_group}_vo_probe_norm_norm_max"] = float(np.nanmax(vo_vals))
+                row[f"{safe_group}_vo_probe_norm_norm_mean"] = float(np.nanmean(vo_vals))
+                row[f"{safe_group}_best_probe_by_vo"] = member_names[best_idx]
+            else:
+                row[f"{safe_group}_vo_probe_norm_norm_max"] = np.nan
+                row[f"{safe_group}_vo_probe_norm_norm_mean"] = np.nan
+                row[f"{safe_group}_best_probe_by_vo"] = None
+
+            row[f"{safe_group}_qk_cosine_max"] = float(np.nanmax(qk_vals)) if np.isfinite(qk_vals).any() else np.nan
+            row[f"{safe_group}_qk_cosine_mean"] = float(np.nanmean(qk_vals)) if np.isfinite(qk_vals).any() else np.nan
+            row[f"{safe_group}_vo_source_cosine_max"] = float(np.nanmax(overlap_vals)) if np.isfinite(overlap_vals).any() else np.nan
+            row[f"{safe_group}_vo_source_cosine_mean"] = float(np.nanmean(overlap_vals)) if np.isfinite(overlap_vals).any() else np.nan
+
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    sort_cols = ["candidate_ov_frob_norm", "layer_idx", "head_idx"]
+    return out.sort_values(sort_cols, ascending=[False, True, True]).reset_index(drop=True)
 
 
 def build_head_metric_trajectory_df(
@@ -332,7 +702,7 @@ def screen_downstream_candidates_by_ov_qk(
             "q_read_score_norm": float(torch.linalg.vector_norm(q_read_vec).item() / max(q_norm, 1e-8)),
             "k_source_score_norm": float(torch.linalg.vector_norm(k_read_vec).item() / max(k_norm, 1e-8)),
             "ov_qk_frob_norm": float(torch.linalg.matrix_norm(ov_qk, ord="fro").item()),
-            "ov_qk_spectral_norm": float(torch.linalg.matrix_norm(ov_qk, ord=2).item()),
+            "ov_qk_spectral_norm": _spectral_norm_cpu(ov_qk),
             "source_ov_frob_norm": source_ov_fro,
             "source_ov_spectral_norm": float(source_ov_spectral),
         }
@@ -350,6 +720,174 @@ def screen_downstream_candidates_by_ov_qk(
     return out.sort_values(
         ["ov_qk_composite_score", "ov_qk_frob_norm", "q_read_score_norm", "k_source_score_norm"],
         ascending=[False, False, False, False],
+    ).reset_index(drop=True)
+
+
+def rank_downstream_candidates_by_structural_chain(
+    transformer,
+    source_head: tuple[int, int],
+    *,
+    write_feature_banks: Sequence[Mapping[str, Any]] | None = None,
+    contrast_feature_banks: Sequence[Mapping[str, Any]] | None = None,
+    candidate_layers: str = "later_only",
+    candidate_head_pairs: Iterable[tuple[int, int]] | None = None,
+    source_rank: int = 4,
+    show_progress: bool = False,
+    progress_desc: str = "Structural chain screening",
+) -> pd.DataFrame:
+    """
+    Rank downstream heads under an OV -> QK -> OV circuit hypothesis.
+
+    The source relation head is treated as a writer via its OV operator; candidate
+    heads are scored by (1) whether their Q/K projections can read from the source
+    OV subspace and (2) whether their own OV operator writes strongly into supplied
+    object/shape feature banks.
+    """
+    transformer = _resolve_cross_attn_transformer(transformer)
+    if len(transformer.transformer_blocks) == 0:
+        raise AttributeError("Expected transformer.transformer_blocks for structural chain screening.")
+
+    if write_feature_banks is None or len(write_feature_banks) == 0:
+        raise ValueError("write_feature_banks must contain at least one feature bank.")
+    write_feature_banks = list(write_feature_banks)
+    contrast_feature_banks = list(contrast_feature_banks or [])
+
+    source_layer, source_head_idx = map(int, source_head)
+    source_attn = transformer.transformer_blocks[source_layer].attn2
+    _, _, source_v_w, source_o_w = _head_weight_views(source_attn, source_head_idx)
+    source_ov = source_o_w.float() @ source_v_w.float()
+    source_ov_fro = float(torch.linalg.matrix_norm(source_ov, ord="fro").item())
+    source_u, source_s, source_vh = _top_singular_subspace(source_ov, max_rank=source_rank)
+    source_rank_used = int(source_u.shape[1])
+    source_spectral = float(source_s[0].item())
+    source_write_vec = source_u[:, 0]
+    source_cond_vec = source_vh[0, :]
+
+    candidate_pairs = _iter_candidate_heads(
+        n_layers=len(transformer.transformer_blocks),
+        n_heads=int(source_attn.heads),
+        source_head=source_head,
+        candidate_layers=candidate_layers,
+        candidate_head_pairs=candidate_head_pairs,
+    )
+    iterator = tqdm(candidate_pairs, desc=progress_desc, unit="head", mininterval=1) if show_progress else candidate_pairs
+
+    rows: list[dict[str, Any]] = []
+    for layer_idx, head_idx in iterator:
+        cross_attn = transformer.transformer_blocks[int(layer_idx)].attn2
+        q_w, k_w, cand_v_w, cand_o_w = _head_weight_views(cross_attn, int(head_idx))
+        q_w = q_w.float()
+        k_w = k_w.float()
+        cand_v_w = cand_v_w.float()
+        cand_o_w = cand_o_w.float()
+        cand_ov = cand_o_w @ cand_v_w
+
+        q_norm = float(torch.linalg.vector_norm(q_w).item())
+        k_norm = float(torch.linalg.vector_norm(k_w).item())
+        cand_ov_fro = float(torch.linalg.matrix_norm(cand_ov, ord="fro").item())
+
+        q_read_vec = q_w @ source_write_vec
+        k_read_vec = k_w @ source_cond_vec
+        q_subspace = q_w @ source_u
+        k_subspace = k_w @ source_vh.T
+        ov_qk = q_w @ source_ov @ k_w.T
+
+        row: dict[str, Any] = {
+            "layer_idx": int(layer_idx),
+            "head_idx": int(head_idx),
+            "head_label": f"L{int(layer_idx)}H{int(head_idx)}",
+            "source_head": f"L{source_layer}H{source_head_idx}",
+            "source_rank_used": source_rank_used,
+            "source_ov_frob_norm": source_ov_fro,
+            "source_ov_spectral_norm": source_spectral,
+            "candidate_ov_frob_norm": cand_ov_fro,
+            "q_read_score": float(torch.linalg.vector_norm(q_read_vec).item()),
+            "k_source_score": float(torch.linalg.vector_norm(k_read_vec).item()),
+            "q_weight_norm": q_norm,
+            "k_weight_norm": k_norm,
+            "q_read_score_norm": float(torch.linalg.vector_norm(q_read_vec).item() / max(q_norm, 1e-8)),
+            "k_source_score_norm": float(torch.linalg.vector_norm(k_read_vec).item() / max(k_norm, 1e-8)),
+            "q_read_subspace_score": float(torch.linalg.matrix_norm(q_subspace, ord="fro").item() / max(q_norm * max(source_rank_used, 1) ** 0.5, 1e-8)),
+            "k_source_subspace_score": float(torch.linalg.matrix_norm(k_subspace, ord="fro").item() / max(k_norm * max(source_rank_used, 1) ** 0.5, 1e-8)),
+            "ov_qk_frob_norm": float(torch.linalg.matrix_norm(ov_qk, ord="fro").item()),
+            "ov_qk_spectral_norm": _spectral_norm_cpu(ov_qk),
+        }
+        row["ov_qk_frob_norm_norm"] = row["ov_qk_frob_norm"] / max(source_ov_fro, 1e-8)
+        row["ov_qk_spectral_norm_norm"] = row["ov_qk_spectral_norm"] / max(source_spectral, 1e-8)
+
+        read_terms = [
+            row["q_read_score_norm"],
+            row["k_source_score_norm"],
+            row["q_read_subspace_score"],
+            row["k_source_subspace_score"],
+            row["ov_qk_frob_norm_norm"],
+        ]
+        row["read_score"] = float(np.mean(read_terms))
+
+        write_bank_scores: list[float] = []
+        chain_bank_max_scores: list[float] = []
+        chain_bank_mean_scores: list[float] = []
+        best_slot_score = -np.inf
+        best_slot_name: str | None = None
+        best_slot_label: str | None = None
+        for bank in write_feature_banks:
+            bank_row = _score_ov_write_to_feature_bank(cand_ov, bank)
+            row.update(bank_row)
+            bank_score = bank_row.get(f"{bank['prefix']}_write_score", np.nan)
+            if np.isfinite(bank_score):
+                write_bank_scores.append(float(bank_score))
+            chain_row = _score_structural_chain_to_feature_bank(q_w, k_w, cand_ov, source_write_vec, bank)
+            row.update(chain_row)
+            bank_chain_max = chain_row.get(f"{bank['prefix']}_chain_score_max", np.nan)
+            bank_chain_mean = chain_row.get(f"{bank['prefix']}_chain_score_mean", np.nan)
+            if np.isfinite(bank_chain_max):
+                chain_bank_max_scores.append(float(bank_chain_max))
+                if float(bank_chain_max) > best_slot_score:
+                    best_slot_score = float(bank_chain_max)
+                    best_slot_name = str(bank["prefix"])
+                    best_slot_label = chain_row.get(f"{bank['prefix']}_chain_best_label")
+            if np.isfinite(bank_chain_mean):
+                chain_bank_mean_scores.append(float(bank_chain_mean))
+        row["object_shape_score"] = float(np.mean(write_bank_scores)) if write_bank_scores else np.nan
+        row["object_shape_chain_score_mean"] = float(np.mean(chain_bank_mean_scores)) if chain_bank_mean_scores else np.nan
+        row["object_shape_chain_score_max"] = float(np.max(chain_bank_max_scores)) if chain_bank_max_scores else np.nan
+        row["best_object_slot"] = best_slot_name
+        row["best_object_shape_label"] = best_slot_label
+
+        contrast_scores: list[float] = []
+        for bank in contrast_feature_banks:
+            bank_row = _score_ov_write_to_feature_bank(cand_ov, bank)
+            row.update(bank_row)
+            bank_score = bank_row.get(f"{bank['prefix']}_write_score", np.nan)
+            if np.isfinite(bank_score):
+                contrast_scores.append(float(bank_score))
+        row["contrast_write_score"] = float(np.mean(contrast_scores)) if contrast_scores else np.nan
+
+        write_terms = []
+        if np.isfinite(row["object_shape_score"]):
+            write_terms.append(row["object_shape_score"])
+        if np.isfinite(row["candidate_ov_frob_norm"]) and np.isfinite(row["source_ov_frob_norm"]):
+            write_terms.append(row["candidate_ov_frob_norm"] / max(row["source_ov_frob_norm"], 1e-8))
+        row["write_score"] = float(np.mean(write_terms)) if write_terms else np.nan
+
+        if np.isfinite(row["object_shape_score"]) and np.isfinite(row["contrast_write_score"]):
+            row["write_preference_score"] = float(row["object_shape_score"] / max(row["object_shape_score"] + row["contrast_write_score"], 1e-8))
+        else:
+            row["write_preference_score"] = np.nan
+
+        chain_terms = []
+        for key in ["read_score", "object_shape_chain_score_max", "object_shape_chain_score_mean", "write_preference_score"]:
+            if np.isfinite(row.get(key, np.nan)):
+                chain_terms.append(float(row[key]))
+        row["chain_score"] = float(np.mean(chain_terms)) if chain_terms else np.nan
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(
+        ["chain_score", "object_shape_chain_score_max", "read_score", "object_shape_score", "ov_qk_frob_norm"],
+        ascending=[False, False, False, False, False],
     ).reset_index(drop=True)
 
 
@@ -450,7 +988,7 @@ def run_pair_ablation_grid(
 
     for ckpt_idx, ckpt_name in enumerate(ckpt_list, start=1):
         ckpt = torch.load(join(ckptdir, ckpt_name), map_location="cpu", weights_only=False)
-        pipeline.transformer.load_state_dict(state_dict_convert(ckpt["state_dict_ema"]))
+        load_pixart_ema_into_transformer(pipeline.transformer, ckpt["state_dict_ema"])
         pipeline.transformer = pipeline.transformer.to(device=device, dtype=weight_dtype)
         del ckpt
         gc.collect()
