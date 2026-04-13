@@ -33,7 +33,7 @@ from diffusers import Transformer2DModel
 from transformers import T5Tokenizer, T5EncoderModel
 
 from utils.pixart_sampling_utils import PixArtAlphaPipeline_custom
-from utils.pixart_utils import state_dict_convert, construct_diffuser_pipeline_from_config
+from utils.pixart_utils import construct_diffuser_pipeline_from_config, load_pixart_ema_into_transformer
 from utils.text_encoder_control_lib import RandomEmbeddingEncoder_wPosEmb, RandomEmbeddingEncoder
 from utils.cv2_eval_utils import print_evaluation_summary
 from utils.eval_cached_embeddings import evaluate_pipeline_on_prompts_with_cached_embeddings
@@ -291,7 +291,7 @@ def create_pipeline_from_config(config, tokenizer, text_encoder, weight_dtype):
         caption_channels=config.caption_channels,
     )
     
-    transformer.load_state_dict(state_dict_convert(model.state_dict()))
+    load_pixart_ema_into_transformer(transformer, model.state_dict())
     
     pipeline = PixArtAlphaPipeline_custom.from_pretrained(
         "PixArt-alpha/PixArt-XL-2-512x512",
@@ -394,8 +394,10 @@ def evaluate_checkpoint_with_cache(pipeline, checkpoint_path, prompt_collections
     
     # Load checkpoint weights
     ckpt = torch.load(checkpoint_path, weights_only=False)
-    pipeline.transformer.load_state_dict(state_dict_convert(
-        ckpt['state_dict_ema'] if use_ema else ckpt['state_dict']))
+    load_pixart_ema_into_transformer(
+        pipeline.transformer,
+        ckpt["state_dict_ema"] if use_ema else ckpt["state_dict"],
+    )
     pipeline.set_progress_bar_config(disable=True)
     
     all_results = []

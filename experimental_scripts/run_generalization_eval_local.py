@@ -43,7 +43,7 @@ from diffusion.utils.misc import read_config
 from diffusers import AutoencoderKL, DPMSolverMultistepScheduler
 from transformers import T5Tokenizer
 
-from utils.pixart_utils import construct_diffuser_transformer_from_config, state_dict_convert
+from utils.pixart_utils import construct_diffuser_transformer_from_config, load_pixart_ema_into_transformer
 from utils.pixart_sampling_utils import PixArtAlphaPipeline_custom
 from utils.relation_shape_dataset_lib import ShapesDataset
 from utils.eval_cached_embeddings import evaluate_pipeline_on_prompts_with_cached_embeddings
@@ -373,7 +373,7 @@ def main():
         print(f"{'='*60}")
 
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        pipeline.transformer.load_state_dict(state_dict_convert(ckpt["state_dict_ema"]))
+        load_pixart_ema_into_transformer(pipeline.transformer, ckpt["state_dict_ema"])
         del ckpt
         if device == "cuda":
             torch.cuda.empty_cache()
